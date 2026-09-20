@@ -207,3 +207,37 @@ button,a,select{-webkit-tap-highlight-color:transparent}
 .seg-type button{font-size:16px;min-height:48px;flex-direction:row}
 .seg-type button.on{background:var(--black);color:var(--yellow)}
 .seg-type button.on small{color:var(--yellow)}
+
+/* ───────── 음성 낭독(필답형) ───────── */
+.voicebar{border:2px solid var(--ink);border-left:8px solid var(--yellow);background:#fff;padding:10px 14px;margin-bottom:14px}
+.vb-main{display:flex;flex-wrap:wrap;gap:10px 18px;align-items:center}
+.vb-f{display:inline-flex;align-items:center;gap:8px;font-weight:700;font-size:14px}
+.vb-rate input[type=range]{width:180px;accent-color:var(--black);min-height:0}
+.vb-rate b{font-family:var(--mono);display:inline-block;min-width:46px;flex:none}
+.vb-rate span{flex:none;white-space:nowrap}
+.vb-more{margin-top:8px;border-top:1px dashed var(--line);padding-top:8px}
+.vb-more summary{cursor:pointer;font-weight:700;font-size:13px;color:var(--muted);user-select:none}
+.vb-set{display:flex;flex-wrap:wrap;gap:10px 18px;align-items:center;margin-top:10px}
+.vb-set select{max-width:min(100%,440px);min-width:0}
+.vb-more,.vb-set,.vb-f{min-width:0}
+.vb-note{font-size:12.5px;color:var(--muted);margin-top:8px;line-height:1.55}
+.vb-note.warn{color:var(--red);font-weight:700}
+.wrap.has-vb{max-height:calc(100vh - 350px)}
+button.say{display:block;margin-top:6px;min-height:30px;padding:0 10px}
+.tbl tr.speaking td{background:var(--yellow-soft)}
+.tbl tr.speaking td.no{box-shadow:inset 6px 0 0 var(--black)}
+@media (max-width:860px){
+  .voicebar{position:sticky;top:0;z-index:20;margin-bottom:12px;padding:8px 12px}
+  .vb-main{flex-wrap:nowrap;gap:10px}
+  .vb-main .pri,.vb-main .dark{flex:0 0 auto;padding:6px 14px}
+  .vb-rate{flex:1 1 auto;min-width:0}
+  .vb-rate input[type=range]{flex:1 1 auto;width:100%;min-width:60px}
+  .vb-set{flex-direction:column;align-items:stretch}
+  .vb-set select{width:100%;max-width:100%}
+  .vb-f{flex-direction:column;align-items:stretch;gap:4px}
+  .vb-rate{flex-direction:row;align-items:center}
+  button.say{display:inline-block;margin:0 0 0 10px;min-height:36px;padding:2px 14px}
+  .wrap.has-vb{max-height:none}
+  .tbl tr.speaking{border-left:8px solid var(--yellow)}
+}
+@media print{.voicebar,button.say{display:none!important}}
