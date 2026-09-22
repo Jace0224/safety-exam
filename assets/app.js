@@ -7,7 +7,7 @@
   var KEY = 'ise.v1';
   var mem = null;
   function blank() {
-    return { added: { written: [], practical: [] }, wrong: {}, mockRes: {}, settings: { apiKey: '', model: 'claude-sonnet-5', tts: { rate: 1, voice: '', scope: 'qa' } } };
+    return { added: { written: [], practical: [] }, wrong: {}, mockRes: {}, bookmarks: {}, solved: {}, settings: { apiKey: '', model: 'claude-sonnet-5', rate: 1 } };
   }
   function load() {
     var d = blank();
@@ -18,6 +18,8 @@
         d.added.practical = (raw.added && raw.added.practical) || [];
         d.wrong = raw.wrong || {};
         d.mockRes = raw.mockRes || {};
+        d.bookmarks = raw.bookmarks || {};
+        d.solved = raw.solved || {};
         d.settings = Object.assign(d.settings, raw.settings || {});
       }
     } catch (e) { if (mem) return mem; }
@@ -60,9 +62,19 @@
   /* 모의고사 문항은 퀴즈·오답노트·목록과 별개로 관리한다 */
   function getList(type) { return QDATA[type].concat(store.added[type]); }
   function findQ(id) {
-    var all = getList('written').concat(getList('practical'));
+    var all = getList('written').concat(getList('practical'), mockAll(), mockPAll());
     for (var i = 0; i < all.length; i++) if (all[i].id === id) return all[i];
     return null;
+  }
+  function isBM(id) { return !!store.bookmarks[id]; }
+  function toggleBM(id) {
+    if (store.bookmarks[id]) delete store.bookmarks[id]; else store.bookmarks[id] = Date.now();
+    save(); updateFAB();
+  }
+  function bmBtnHTML(id, withLabel) {
+    var on = isBM(id);
+    return '<button class="bmbtn' + (on ? ' on' : '') + '" data-bm="' + id + '" aria-label="책갈피" title="책갈피">' +
+      (on ? '★' : '☆') + (withLabel ? ' 책갈피' : '') + '</button>';
   }
   function qNo(q) {
     if (q.mock) return 'M' + q.mock + '-' + (QDATA.mock[q.mock].indexOf(q) + 1);
@@ -100,7 +112,8 @@
     { id: 'mock', plate: '03', label: '모의고사', view: viewMock, cnt: function () { return mockAll().length + mockPAll().length; } },
     { id: 'gen', plate: '04', label: '문제생성', view: viewGen, cnt: function () { return ''; } },
     { id: 'quiz', plate: '05', label: '퀴즈', view: function () { viewQuiz('quiz'); }, cnt: function () { return getList('written').filter(hasBlanks).length + getList('practical').filter(hasBlanks).length; } },
-    { id: 'note', plate: '06', label: '오답노트', view: function () { viewQuiz('note'); }, cnt: function () { return Object.keys(store.wrong).filter(function (id) { return findQ(id); }).length; } }
+    { id: 'note', plate: '06', label: '오답노트', view: function () { viewQuiz('note'); }, cnt: function () { return Object.keys(store.wrong).filter(function (id) { return findQ(id); }).length; } },
+    { id: 'bookmarks', plate: '07', label: '북마크', view: viewBookmarks, cnt: function () { return Object.keys(store.bookmarks).length; } }
   ];
   function drawNav(cur) {
     document.getElementById('nav').innerHTML = ROUTES.map(function (r) {
@@ -111,9 +124,10 @@
     var id = (location.hash || '#written').slice(1);
     var r = ROUTES.filter(function (x) { return x.id === id; })[0] || ROUTES[0];
     clearInterval(mockUI.timer);
-    TTS.stop();
+    if (!floatState.auto) stopSpeak();
     drawNav(r.id);
     r.view();
+    updateFAB();
     window.scrollTo(0, 0);
   }
   window.addEventListener('hashchange', route);
@@ -122,337 +136,136 @@
     return '<div class="head"><div><h1>' + title + '</h1><p>' + sub + '</p></div><div>' + (right || '') + '</div></div>';
   }
 
-  /* ───────── 음성 낭독 (필답형 목록) ─────────
-   * 브라우저 내장 Web Speech API(speechSynthesis)를 사용합니다. 서버·API 키 불필요.
-   * 브라우저는 목소리 성별을 알려주지 않으므로 알려진 이름으로 여성 음성을 추정해 우선 선택합니다. */
-  var TTS = (function () {
-    var ok = !!(window.speechSynthesis && window.SpeechSynthesisUtterance);
-    var synth = ok ? window.speechSynthesis : null;
-    var FEMALE = /yuna|유나|sora|소라|heami|헤미|sun-?hi|선희|seoyeon|서연|google\s*한국어|google\s*korean|female|여성|여자/i;
-    var MALE = /injoon|인준|minsu|민수|hyunsu|현수|gookmin|\bmale\b|남성|남자/i;
-    var GAP = 1500, ROWGAP = 1000;     /* 문제→정답 대기, 문제 사이 간격(ms) */
-    var st = { gen: 0, playing: false, ids: [], row: 0, segs: [], seg: 0, timer: 0, wd: 0, errs: 0, cur: '', ui: null };
-
-    function cfg() {
-      var t = store.settings.tts || (store.settings.tts = {});
-      if (!(t.rate >= 0.5 && t.rate <= 2)) t.rate = 1;
-      if (t.scope !== 'q') t.scope = 'qa';
-      if (typeof t.voice !== 'string') t.voice = '';
-      return t;
-    }
-    function gender(v) {
-      var n = v.name + ' ' + (v.voiceURI || '');
-      if (FEMALE.test(n)) return 'f';
-      if (MALE.test(n)) return 'm';
-      return 'u';
-    }
-    function voices() {
-      if (!ok) return [];
-      var list = (synth.getVoices() || []).map(function (v, i) {
-        return { v: v, i: i, id: v.voiceURI || v.name, name: v.name, g: gender(v) };
-      }).filter(function (o) {
-        return /^ko([-_]|$)/i.test(o.v.lang || '') || /korean|한국/i.test(o.v.name);
-      });
-      var rank = { f: 0, u: 1, m: 2 };
-      list.sort(function (a, b) { return rank[a.g] - rank[b.g] || a.i - b.i; });
-      return list;
-    }
-    function pick() {
-      var vs = voices(), want = cfg().voice;
-      if (!vs.length) return null;
-      if (want) for (var i = 0; i < vs.length; i++) if (vs[i].id === want) return vs[i];
-      return vs[0];
-    }
-
-    /* 낭독용 텍스트 정리: 단위·기호·약어를 소리 나는 대로 바꾼다 */
-    var UNITS = [
-      ['m/s', '미터 매 초'], ['m²', '제곱미터'], ['m³', '세제곱미터'], ['vol%', '부피퍼센트'],
-      ['㎜', '밀리미터'], ['㎝', '센티미터'], ['㎞', '킬로미터'], ['㎏', '킬로그램'], ['㎡', '제곱미터'], ['㎥', '세제곱미터'], ['℃', '도'], ['%', '퍼센트'],
-      ['mm', '밀리미터'], ['cm', '센티미터'], ['km', '킬로미터'], ['kg', '킬로그램'], ['mg', '밀리그램'],
-      ['mA', '밀리암페어'], ['kV', '킬로볼트'], ['dB', '데시벨'], ['ppm', '피피엠'], ['MPa', '메가파스칼'], ['kPa', '킬로파스칼'],
-      ['Hz', '헤르츠'], ['kW', '킬로와트'], ['ms', '밀리초'], ['mJ', '밀리줄'], ['pF', '피코패럿'], ['kN', '킬로뉴턴'], ['lux', '럭스'],
-      ['m', '미터'], ['V', '볼트'], ['A', '암페어']
-    ];
-    var UMAP = {};
-    UNITS.forEach(function (u) { UMAP[u[0]] = u[1]; });
-    var UNIT_RE = new RegExp('(\\d)\\s*(' + UNITS.map(function (u) { return u[0].replace(/[.*+?^${}()|[\]\\\/]/g, '\\$&'); })
-      .sort(function (a, b) { return b.length - a.length; }).join('|') + ')(?![A-Za-z])', 'g');
-    var ABBR = { HAZOP: '하잡', MSDS: '엠에스디에스', FTA: '에프티에이', ETA: '이티에이', FMEA: '에프엠이에이', FMECA: '에프엠이씨에이', PHA: '피에이치에이', PSM: '피에스엠', TWI: '티더블유아이', CCA: '씨씨에이' };
-    var SUP = { '⁰': 0, '¹': 1, '²': 2, '³': 3, '⁴': 4, '⁵': 5, '⁶': 6, '⁷': 7, '⁸': 8, '⁹': 9 };
-    var SUB = { '₀': 0, '₁': 1, '₂': 2, '₃': 3, '₄': 4, '₅': 5, '₆': 6, '₇': 7, '₈': 8, '₉': 9 };
-    var FRAC = { '½': '2분의 1 ', '⅓': '3분의 1 ', '⅔': '3분의 2 ', '¼': '4분의 1 ', '¾': '4분의 3 ' };
-    function prep(s) {
-      s = String(s);
-      /* 등호: 한글 뒤는 은/는, 그 밖(수식)은 '이퀄' — 다른 변환보다 먼저 처리해 앞 글자를 보존 */
-      s = s.replace(/([가-힣])\s*[=＝]\s*/g, function (m, ch) { return ch + ((ch.charCodeAt(0) - 0xAC00) % 28 ? '은 ' : '는 '); });
-      s = s.replace(/\s*[=＝]\s*/g, ' 이퀄 ');
-      s = s.replace(/m²/g, '제곱미터').replace(/m³/g, '세제곱미터');
-      s = s.replace(/([₀-₉]+)/g, function (m) { return m.split('').map(function (c) { return SUB[c]; }).join(''); });
-      s = s.replace(/([⁻⁺]?)([⁰¹²³⁴⁵⁶⁷⁸⁹]+)/g, function (m, sg, d) {
-        return '의 ' + (sg === '⁻' ? '마이너스 ' : '') + d.split('').map(function (c) { return SUP[c]; }).join('') + '제곱 ';
-      });
-      s = s.replace(/제곱\s*J(?![A-Za-z])/g, '제곱 줄');
-      s = s.replace(/[½⅓⅔¼¾]/g, function (c) { return FRAC[c]; });
-      s = s.replace(/[①-⑩]/g, function (c) { return (c.charCodeAt(0) - 0x2460 + 1) + '번. '; });
-      s = s.replace(/[㎜㎝㎞㎏㎡㎥℃]/g, function (c) { return UMAP[c]; });
-      s = s.replace(UNIT_RE, function (m, d, u) { return d + UMAP[u]; });
-      s = s.replace(/\b(HAZOP|MSDS|FTA|ETA|FMEA|FMECA|PHA|PSM|TWI|CCA)\b/g, function (m) { return ABBR[m]; });
-      s = s.replace(/(\d)\s*:\s*(?=\d)/g, '$1 대 ');
-      s = s.replace(/([0-9A-Za-z)])\s*\/\s*(?=[0-9A-Za-z(])/g, '$1 나누기 ').replace(/\s*\/\s*/g, ', ');
-      s = s.replace(/×/g, ' 곱하기 ').replace(/÷/g, ' 나누기 ').replace(/≥/g, ' 이상 ').replace(/≤/g, ' 이하 ')
-        .replace(/±/g, ' 플러스 마이너스 ').replace(/~/g, ' 에서 ').replace(/·/g, ', ').replace(/[▶※●■◆★☞]/g, ' ');
-      return s.replace(/[ \t]+/g, ' ').trim();
-    }
-    /* 긴 글은 문장 단위로 끊어 읽는다(일부 브라우저는 긴 문장을 중간에 멈춤). 소수점(2.5)은 끊지 않는다. */
-    function chunk(text) {
-      var out = [];
-      String(text).split(/\n+/).forEach(function (line) {
-        line.trim().replace(/([.?!])\s+/g, '$1\u0001').split('\u0001').forEach(function (s) {
-          s = s.trim();
-          while (s.length > 140) {
-            var cut = Math.max(s.lastIndexOf(', ', 140), s.lastIndexOf(' ', 140));
-            if (cut < 40) cut = 140;
-            out.push(s.slice(0, cut + 1).trim()); s = s.slice(cut + 1).trim();
-          }
-          if (s) out.push(s);
-        });
-      });
-      return out;
-    }
-    function plain(a) { return a.replace(/\{\{([^}]+)\}\}/g, function (m, g) { return g.split('|')[0].trim(); }); }
-    function segsFor(q) {
-      var s = [], no = qNo(q), scope = cfg().scope;
-      var hd = /^\d+$/.test(no) ? no + '번.' : (q.user ? '사용자 추가 문제.' : '');
-      chunk(prep((hd ? hd + '\n' : '') + q.q)).forEach(function (t) { s.push({ t: t }); });
-      if (scope === 'qa') {
-        s.push({ pause: GAP }, { t: '정답.' });
-        chunk(prep(plain(q.a))).forEach(function (t) { s.push({ t: t }); });
-      }
-      s.push({ pause: ROWGAP });
-      return s;
-    }
-
-    function emit() { if (st.ui) st.ui({ playing: st.playing, id: st.playing ? st.cur : '' }); }
-    function clearTimers() { clearTimeout(st.timer); clearTimeout(st.wd); }
-    function speakText(text, done, gen) {
-      var u = new SpeechSynthesisUtterance(text), p = pick(), finished = false;
-      u.lang = (p && p.v.lang) || 'ko-KR';
-      if (p) u.voice = p.v;
-      u.rate = cfg().rate; u.pitch = 1;
-      function fin() { if (finished || gen !== st.gen) return; finished = true; clearTimeout(st.wd); done(); }
-      u.onend = function () { st.errs = 0; fin(); };
-      u.onerror = function (e) {
-        if (gen !== st.gen) return;
-        if (e.error === 'interrupted' || e.error === 'canceled') return;
-        if (e.error === 'not-allowed') { stop(); toast('브라우저가 음성 재생을 막았습니다. 재생 버튼을 다시 눌러 주세요.'); return; }
-        if (++st.errs >= 3) { stop(); toast('음성 재생에 실패했습니다. 기기의 음성(TTS) 설정을 확인해 주세요.'); return; }
-        fin();
-      };
-      synth.speak(u);
-      /* 일부 기기에서 onend가 오지 않는 경우를 대비한 안전장치 */
-      var chk = function () {
-        if (gen !== st.gen || finished) return;
-        if (synth.speaking || synth.pending) st.wd = setTimeout(chk, 1500); else fin();
-      };
-      st.wd = setTimeout(chk, 3000 + text.length * 250 / cfg().rate);
-    }
-    function end() { st.playing = false; st.cur = ''; emit(); }
-    function nextSeg() {
-      clearTimers();
-      if (!st.playing) return;
-      if (st.seg >= st.segs.length) { st.row++; return startRow(); }
-      var s = st.segs[st.seg], gen = st.gen;
-      if (s.pause) { st.timer = setTimeout(function () { if (gen === st.gen) { st.seg++; nextSeg(); } }, s.pause); return; }
-      speakText(s.t, function () { st.seg++; nextSeg(); }, gen);
-    }
-    function startRow() {
-      var q;
-      while (st.row < st.ids.length && !(q = findQ(st.ids[st.row]))) st.row++;
-      if (st.row >= st.ids.length) return end();
-      st.segs = segsFor(q); st.seg = 0; st.cur = q.id; emit(); nextSeg();
-    }
-    function stop() {
-      st.gen++; st.playing = false; st.cur = ''; clearTimers();
-      if (ok) synth.cancel();
-      emit();
-    }
-    function play(ids) {
-      if (!ok) return;
-      stop();
-      st.ids = ids; st.row = 0; st.errs = 0; st.playing = true;
-      var g = st.gen;
-      setTimeout(function () { if (g === st.gen && st.playing) startRow(); }, 60);
-    }
-    /* 속도·목소리 변경은 지금 읽는 문장부터, 범위 변경은 지금 읽는 문제를 처음부터 다시 적용 */
-    function refresh(wholeRow) {
-      if (!ok || !st.playing) return;
-      var q = findQ(st.cur);
-      if (wholeRow && q) { st.segs = segsFor(q); st.seg = 0; }
-      st.gen++; clearTimers(); synth.cancel();
-      var g = st.gen;
-      setTimeout(function () { if (g === st.gen && st.playing) nextSeg(); }, 80);
-    }
-    function sample(text) {
-      if (!ok) return;
-      stop();
-      speakText(prep(text), function () {}, st.gen);
-    }
-
-    if (ok) {
-      window.addEventListener('pagehide', stop);
-      if (synth.addEventListener) synth.addEventListener('voiceschanged', function () { if (TTS && TTS.onVoices) TTS.onVoices(); });
-    }
-    return {
-      ok: ok, cfg: cfg, save: save, voices: voices, pick: pick, play: play, stop: stop, refresh: refresh, sample: sample,
-      prep: prep, chunk: chunk,
-      bind: function (fn) { st.ui = fn; }, onVoices: null,
-      state: function () { return { playing: st.playing, id: st.cur }; }
-    };
-  })();
-
   /* ───────── 필답형 / 작업형 목록 ───────── */
-  var GLABEL = { f: '여성', m: '남성', u: '성별 미확인' };
-  function voiceBarHTML() {
-    if (!TTS.ok) return '<div class="voicebar"><div class="vb-note warn">이 브라우저는 음성 낭독을 지원하지 않습니다. Chrome·Edge·Safari 최신 버전에서 이용해 주세요.</div></div>';
-    return '<div class="voicebar" id="vb"><div class="vb-main">' +
-      '<button class="pri" id="vplay">▶ 전체 듣기</button>' +
-      '<label class="vb-f vb-rate"><span>속도</span> <input type="range" id="vrate" min="0.5" max="2" step="0.1" aria-label="낭독 속도"> <b id="vrv">1.0×</b></label></div>' +
-      '<details class="vb-more" id="vmore"><summary id="vsum">목소리 · 범위</summary><div class="vb-set">' +
-      '<label class="vb-f">목소리 <select id="vvoice"></select></label>' +
-      '<label class="vb-f">읽기 범위 <select id="vscope"><option value="qa">문제 + 정답</option><option value="q">문제만</option></select></label>' +
-      '<button class="sm" id="vsample">샘플 듣기</button></div>' +
-      '<div class="vb-note" id="vnote"></div></details></div>';
-  }
-  function rowIds() {
-    return Array.prototype.map.call(document.querySelectorAll('#tbody tr[data-id]'), function (tr) { return tr.getAttribute('data-id'); });
-  }
-  function initVoice() {
-    var $ = function (id) { return document.getElementById(id); };
-    var c = TTS.cfg(), lastId = '';
-    $('vrate').value = c.rate;
-    $('vscope').value = c.scope;
-    if (window.innerWidth > 860) $('vmore').setAttribute('open', '');
-    function showRate() { $('vrv').textContent = Number($('vrate').value).toFixed(1) + '×'; }
-    showRate();
-
-    function fill() {
-      var sel = $('vvoice'); if (!sel) return;
-      var vs = TTS.voices(), cur = TTS.cfg().voice;
-      if (cur && !vs.some(function (v) { return v.id === cur; })) cur = '';
-      sel.innerHTML = '<option value="">자동 (여성 음성 우선)</option>' + vs.map(function (v) {
-        return '<option value="' + esc(v.id) + '">' + esc(v.name) + ' · ' + GLABEL[v.g] + '</option>';
-      }).join('');
-      sel.value = cur;
-      var p = TTS.pick(), n = $('vnote'), sum = $('vsum');
-      if (!p) {
-        sum.textContent = '목소리 · 범위';
-        n.className = 'vb-note warn';
-        n.textContent = '이 기기에서 한국어 음성을 찾지 못했습니다. 기기의 음성(TTS) 설정에서 한국어 음성을 설치해 주세요. 지금은 브라우저 기본 음성으로 읽습니다.';
-        return;
-      }
-      sum.textContent = '목소리: ' + p.name + ' (' + GLABEL[p.g] + ')';
-      if (!TTS.cfg().voice && p.g !== 'f') {
-        n.className = 'vb-note warn';
-        n.textContent = '여성 음성으로 확인된 목소리가 없어 ' + p.name + ' 음성으로 읽습니다. 목록에서 다른 목소리를 골라 들어 보세요.';
-      } else {
-        n.className = 'vb-note';
-        n.textContent = '브라우저는 목소리 성별을 알려주지 않아 Yuna·Heami·SunHi·Google 한국어 등 알려진 이름으로 여성 음성을 구분합니다.';
-      }
-    }
-    TTS.onVoices = fill;
-    fill(); setTimeout(fill, 600); setTimeout(fill, 1800);   /* 일부 기기는 음성 목록이 늦게 채워짐 */
-
-    TTS.bind(function (s) {
-      var pb = $('vplay'); if (!pb) return;
-      pb.textContent = s.playing ? '■ 정지' : '▶ 전체 듣기';
-      pb.classList.toggle('pri', !s.playing); pb.classList.toggle('dark', s.playing);
-      if (s.playing && window.innerWidth <= 860) $('vmore').removeAttribute('open');   /* 모바일: 재생 중 화면을 가리지 않도록 설정 접기 */
-      Array.prototype.forEach.call(document.querySelectorAll('#tbody tr[data-id]'), function (tr) {
-        var on = s.playing && tr.getAttribute('data-id') === s.id;
-        tr.classList.toggle('speaking', on);
-        var b = tr.querySelector('.say'); if (b) b.textContent = on ? '■' : '▶';
-        if (on && s.id !== lastId) tr.scrollIntoView({ block: 'center', behavior: 'smooth' });
-      });
-      lastId = s.playing ? s.id : '';
-    });
-    $('vplay').addEventListener('click', function () {
-      if (TTS.state().playing) { TTS.stop(); return; }
-      var ids = rowIds();
-      if (!ids.length) { toast('읽을 문제가 없습니다.'); return; }
-      TTS.play(ids);
-    });
-    $('vrate').addEventListener('input', showRate);
-    $('vrate').addEventListener('change', function () { TTS.cfg().rate = Number($('vrate').value); TTS.save(); TTS.refresh(false); });
-    $('vvoice').addEventListener('change', function (e) { TTS.cfg().voice = e.target.value; TTS.save(); fill(); TTS.refresh(false); });
-    $('vscope').addEventListener('change', function (e) { TTS.cfg().scope = e.target.value; TTS.save(); TTS.refresh(true); });
-    $('vsample').addEventListener('click', function () { TTS.sample('안녕하세요. 산업안전기사 필답형 문제를 읽어 드립니다. 안전난간의 높이는 90센티미터 이상입니다.'); });
-  }
-
   var listUI = {};
+  function spkBtnsHTML(id) {
+    return '<button class="sm spk" data-spk="' + id + ':q" title="문제 듣기">🔊문제</button>' +
+      '<button class="sm spk" data-spk="' + id + ':a" title="정답 듣기">🔊정답</button>';
+  }
+  var listRowBlanks = {};
+  function blankRow(type, q) {
+    var tr = document.createElement('tr');
+    tr.setAttribute('data-id', q.id);
+    var extra = hasBlanks(q);
+    var abHTML = '';
+    tr.innerHTML = '<td class="no">' + qNo(q) + '</td>' +
+      '<td class="sj">' + iconFor(q.subject) + '<span class="subj-chip">' + esc(q.subject) + '</span></td>' +
+      '<td class="q">' + esc(q.q) + '</td>' +
+      '<td class="a"><div class="blankslot" id="bs-' + q.id + '"></div>' +
+      (!extra ? '<div class="ans">' + ansHTML(q.a) + '</div>' : '') +
+      '<div class="rowbtns">' + (extra ? '<button class="sm pri" data-grade="' + q.id + '">채점</button>' : '') +
+      spkBtnsHTML(q.id) + bmBtnHTML(q.id, true) +
+      (q.user ? '<button class="sm danger" data-del="' + q.id + '">삭제</button>' : '') + '</div>' +
+      (extra ? '<div class="reveal-inline"></div>' : '') + '</td>';
+    if (extra) {
+      var ab = buildAnswer(q);
+      listRowBlanks[q.id] = ab.blanks;
+      tr.querySelector('#bs-' + q.id).appendChild(ab.box);
+    }
+    return tr;
+  }
+  function fullRow(q) {
+    return '<tr data-id="' + q.id + '"><td class="no">' + qNo(q) + '</td><td class="sj">' + iconFor(q.subject) + '<span class="subj-chip">' + esc(q.subject) + '</span></td>' +
+      '<td class="q">' + esc(q.q) + '</td><td class="a"><div class="ans">' + ansHTML(q.a) + '</div><div class="hint-hide">클릭하면 정답이 보입니다</div>' +
+      '<div class="rowbtns">' + spkBtnsHTML(q.id) + bmBtnHTML(q.id, true) + (q.user ? '<button class="sm danger" data-del="' + q.id + '">삭제</button>' : '') + '</div></td></tr>';
+  }
   function viewList(type) {
-    var ui = listUI[type] || (listUI[type] = { q: '', subj: '', hide: false });
+    var ui = listUI[type] || (listUI[type] = { q: '', subj: '', hide: false, mode: 'blank' });
     var base = QDATA[type];
-    var voice = type === 'written';   /* 음성 낭독은 필답형 목록에서만 */
-    var vok = voice && TTS.ok;
     root.innerHTML =
       head(TYPES[type] + ' 예상문제', type === 'written'
-        ? '과목별 필답형 예상문제와 정답. 노란 표시는 정답의 핵심어입니다.'
-        : '영상 상황형 작업형 예상문제. 위험요인과 안전조치를 함께 익힙니다.',
+        ? '과목별 필답형 예상문제. 정답의 핵심어를 괄호 안 빈칸에 채워 넣으며 익힙니다. 🔊 버튼으로 듣거나 “전체 듣기”로 이어 들을 수 있습니다.'
+        : '영상 상황형 작업형 예상문제. 위험요인·안전조치의 핵심어를 괄호 안 빈칸에 채워 넣으며 익힙니다. 🔊 버튼으로 듣거나 “전체 듣기”로 이어 들을 수 있습니다.',
         '<span class="tag">' + base.length + '문항</span>') +
+      '<div class="seg seg-mode" id="lmode"><button data-m="blank" class="' + (ui.mode === 'blank' ? 'on' : '') + '">괄호 넣기</button><button data-m="full" class="' + (ui.mode === 'full' ? 'on' : '') + '">정답 전체보기</button></div>' +
       '<div class="bar">' +
       '<input type="search" id="fq" class="grow" placeholder="문제·정답 검색" value="' + esc(ui.q) + '">' +
       '<select id="fs"><option value="">전체 과목</option>' + opts(subjects(type), ui.subj) + '</select>' +
-      '<label class="chk"><input type="checkbox" id="fh"' + (ui.hide ? ' checked' : '') + '> 정답 가리기</label>' +
+      (ui.mode === 'full' ? '<label class="chk"><input type="checkbox" id="fh"' + (ui.hide ? ' checked' : '') + '> 정답 가리기</label>' : '') +
+      '<button class="sm" id="playAll" title="지금 표시된 문제를 문제→정답 순서로 이어 듣습니다">▶ 전체 듣기</button>' +
+      '<button class="sm" id="playBM" title="이 화면에서 북마크한 문제만 이어 듣습니다">★ 북마크만 듣기</button>' +
       '<span class="meta" id="fc"></span></div>' +
-      (voice ? voiceBarHTML() : '') +
-      '<div class="wrap' + (vok ? ' has-vb' : '') + '"><table class="tbl list' + (ui.hide ? ' hide' : '') + '" id="tb"><thead><tr><th>No</th><th>과목</th><th>문제</th><th>정답</th></tr></thead><tbody id="tbody"></tbody></table></div>';
+      '<div class="wrap"><table class="tbl list' + (ui.mode === 'full' && ui.hide ? ' hide' : '') + '" id="tb"><thead><tr><th>No</th><th>과목</th><th>문제</th><th>' + (ui.mode === 'blank' ? '괄호 넣기' : '정답') + '</th></tr></thead><tbody id="tbody"></tbody></table></div>';
 
-    function row(q) {
-      return '<tr data-id="' + q.id + '"><td class="no">' + qNo(q) +
-        (vok ? '<button class="sm say" data-say="' + q.id + '" title="여기서부터 듣기" aria-label="' + qNo(q) + '번부터 듣기">▶</button>' : '') + '</td><td class="sj"><span class="subj-chip">' + esc(q.subject) + '</span></td>' +
-        '<td class="q">' + esc(q.q) + '</td><td class="a"><div class="ans">' + ansHTML(q.a) + '</div><div class="hint-hide">클릭하면 정답이 보입니다</div>' +
-        (q.user ? '<div style="margin-top:8px"><button class="sm danger" data-del="' + q.id + '">삭제</button></div>' : '') + '</td></tr>';
-    }
-    function draw() {
-      if (vok) TTS.stop();
+    function computeLists() {
       var kw = ui.q.trim().toLowerCase();
       var pass = function (q) {
         return subjOk(q, ui.subj) && (!kw || (q.q + ' ' + q.a).toLowerCase().indexOf(kw) >= 0);
       };
-      var main = base.filter(pass), user = store.added[type].filter(function (q) { return !ui.subj && pass(q) || (ui.subj && pass(q)); });
-      var h = main.map(row).join('');
-      var mc = 0;
-      if (store.added[type].length) {
-        h += '<tr class="sec"><td colspan="4">[사용자추가] <span class="meta" style="color:#111">' + store.added[type].length + '문항</span></td></tr>' + user.map(row).join('');
+      return { main: base.filter(pass), user: store.added[type].filter(pass) };
+    }
+    function draw() {
+      var L = computeLists(), main = L.main, user = L.user;
+      var tbody = document.getElementById('tbody');
+      if (!main.length && !user.length) {
+        tbody.innerHTML = '<tr><td colspan="4" class="empty">조건에 맞는 문제가 없습니다.</td></tr>';
+      } else if (ui.mode === 'blank') {
+        listRowBlanks = {};
+        tbody.innerHTML = '';
+        var frag = document.createDocumentFragment();
+        main.forEach(function (q) { frag.appendChild(blankRow(type, q)); });
+        if (user.length) {
+          var sec = document.createElement('tr'); sec.className = 'sec';
+          sec.innerHTML = '<td colspan="4">[사용자추가] <span class="meta" style="color:#111">' + store.added[type].length + '문항</span></td>';
+          frag.appendChild(sec);
+          user.forEach(function (q) { frag.appendChild(blankRow(type, q)); });
+        }
+        tbody.appendChild(frag);
+      } else {
+        var h = main.map(fullRow).join('');
+        if (user.length) h += '<tr class="sec"><td colspan="4">[사용자추가] <span class="meta" style="color:#111">' + store.added[type].length + '문항</span></td></tr>' + user.map(fullRow).join('');
+        tbody.innerHTML = h;
       }
-      if (!main.length && !user.length && !mc) h = '<tr><td colspan="4" class="empty">조건에 맞는 문제가 없습니다.</td></tr>';
-      document.getElementById('tbody').innerHTML = h;
-      document.getElementById('fc').textContent = (main.length + mc + user.length) + '개 표시';
+      document.getElementById('fc').textContent = (main.length + user.length) + '개 표시';
     }
     draw();
+    document.getElementById('playAll').addEventListener('click', function () {
+      var L = computeLists(), ids = L.main.concat(L.user).map(function (q) { return q.id; });
+      openFloat(ids, ids[0], true);
+    });
+    document.getElementById('playBM').addEventListener('click', function () {
+      var L = computeLists(), ids = L.main.concat(L.user).filter(function (q) { return isBM(q.id); }).map(function (q) { return q.id; });
+      if (!ids.length) { toast('북마크한 문제가 없습니다. ☆ 책갈피 버튼으로 먼저 담아보세요.'); return; }
+      openFloat(ids, ids[0], true);
+    });
+    document.getElementById('lmode').addEventListener('click', function (e) {
+      var b = e.target.closest('button[data-m]'); if (!b) return;
+      ui.mode = b.getAttribute('data-m'); viewList(type);
+    });
     document.getElementById('fq').addEventListener('input', function (e) { ui.q = e.target.value; draw(); });
     document.getElementById('fs').addEventListener('change', function (e) { ui.subj = e.target.value; draw(); });
-    document.getElementById('fh').addEventListener('change', function (e) {
+    var fh = document.getElementById('fh');
+    if (fh) fh.addEventListener('change', function (e) {
       ui.hide = e.target.checked;
       document.getElementById('tb').classList.toggle('hide', ui.hide);
     });
-    if (vok) initVoice();
     document.getElementById('tbody').addEventListener('click', function (e) {
-      var sy = e.target.closest('[data-say]');
-      if (sy) {
-        var sid = sy.getAttribute('data-say');
-        if (TTS.state().playing && TTS.state().id === sid) { TTS.stop(); return; }
-        var ids = rowIds(); TTS.play(ids.slice(Math.max(0, ids.indexOf(sid)))); return;
+      var g = e.target.closest('[data-grade]');
+      if (g) {
+        var gid = g.getAttribute('data-grade'), blanks = listRowBlanks[gid], q = findQ(gid);
+        if (!blanks || !q) return;
+        var okc = gradeBlanks(q, blanks), all = okc === blanks.length;
+        blanks.forEach(function (b) { b.inp.classList.toggle('ok', b.ok); b.inp.classList.toggle('ng', !b.ok); });
+        var rv = g.closest('tr').querySelector('.reveal-inline');
+        rv.className = 'reveal-inline ' + (all ? 'ok' : 'ng');
+        rv.textContent = (all ? '정답입니다! ' : '오답이 있습니다. ') + okc + ' / ' + blanks.length + ' 빈칸';
+        return;
+      }
+      var bm = e.target.closest('[data-bm]');
+      if (bm) {
+        toggleBM(bm.getAttribute('data-bm'));
+        bm.outerHTML = bmBtnHTML(bm.getAttribute('data-bm'), true);
+        drawNav(type); return;
       }
       var d = e.target.closest('[data-del]');
       if (d) {
         if (!confirm('이 사용자추가 문제를 삭제할까요?')) return;
         var id = d.getAttribute('data-del');
         store.added[type] = store.added[type].filter(function (q) { return q.id !== id; });
-        delete store.wrong[id]; save(); drawNav(type); viewList(type); return;
+        delete store.wrong[id]; delete store.bookmarks[id]; save(); drawNav(type); updateFAB(); viewList(type); return;
       }
       var td = e.target.closest('td.a');
-      if (td && ui.hide) td.parentNode.classList.toggle('shown');
+      if (td && ui.mode === 'full' && ui.hide) td.parentNode.classList.toggle('shown');
     });
   }
 
@@ -508,9 +321,10 @@
     }
     function row(q, i) {
       var r = store.mockRes[q.id] || '';
-      return '<tr data-id="' + q.id + '" class="' + (r ? 'r-' + r : '') + '"><td class="no">' + (i + 1) + '</td><td class="sj"><span class="subj-chip">' + esc(q.subject) + '</span></td>' +
+      return '<tr data-id="' + q.id + '" class="' + (r ? 'r-' + r : '') + '"><td class="no">' + (i + 1) + '</td><td class="sj">' + iconFor(q.subject) + '<span class="subj-chip">' + esc(q.subject) + '</span></td>' +
         '<td class="q">' + esc(q.q) + '</td><td class="a"><div class="ans">' + ansHTML(q.a) + '</div><div class="hint-hide">클릭하면 정답이 보입니다</div>' +
-        '<div class="mk"><button class="o' + (r === 'o' ? ' on' : '') + '" data-mk="o">맞음</button><button class="x' + (r === 'x' ? ' on' : '') + '" data-mk="x">틀림</button></div></td></tr>';
+        '<div class="mk"><button class="o' + (r === 'o' ? ' on' : '') + '" data-mk="o">맞음</button><button class="x' + (r === 'x' ? ' on' : '') + '" data-mk="x">틀림</button>' +
+        '<button class="spk" data-spk="' + q.id + ':qa" title="문제·정답 듣기">🔊</button>' + bmBtnHTML(q.id, false) + '</div></td></tr>';
     }
     function drawRows() {
       var h = '';
@@ -549,6 +363,8 @@
       save(); viewMock();
     });
     document.getElementById('tbody').addEventListener('click', function (e) {
+      var bm = e.target.closest('[data-bm]');
+      if (bm) { toggleBM(bm.getAttribute('data-bm')); bm.outerHTML = bmBtnHTML(bm.getAttribute('data-bm'), false); drawNav('bookmarks'); return; }
       var mk = e.target.closest('button[data-mk]');
       if (mk) {
         var tr = mk.closest('tr'), id = tr.getAttribute('data-id'), v = mk.getAttribute('data-mk');
@@ -591,6 +407,10 @@
       '<textarea id="ga" rows="10" placeholder="send를 누르면 정답이 여기에 표시됩니다. 직접 수정하거나 직접 입력할 수도 있습니다.">' + esc(genState.a) + '</textarea>' +
       '<div class="row"><button class="dark" id="gadd">문제목록추가</button><span class="note">선택한 유형의 목록 하단 [사용자추가]에 등록됩니다.</span></div></section>' +
       '</div>' +
+      '<details class="set" open><summary>🔊 음성 읽기 속도</summary>' +
+      '<div class="field"><label for="rateSel">문제·정답을 읽어줄 때의 속도</label>' +
+      '<select id="rateSel">' + RATES.map(function (r) { return '<option value="' + r + '"' + (r === (s.rate || 1) ? ' selected' : '') + '>' + r + '배속</option>'; }).join('') + '</select></div>' +
+      '<p class="note">필답형·작업형·퀴즈·북마크·화면 위 고정 보기 창의 🔊 버튼과 전체 듣기에 모두 적용됩니다. 고정 보기 창의 속도 버튼(예: 1x)을 눌러도 바뀝니다.</p></details>' +
       '<details class="set"' + (s.apiKey ? '' : ' open') + '><summary>Claude 연결 설정 · 데이터 백업</summary>' +
       '<div class="field"><label for="gk">Anthropic API 키</label><input type="password" id="gk" autocomplete="off" placeholder="sk-ant-..." value="' + esc(s.apiKey) + '"></div>' +
       '<div class="field"><label for="gm">모델</label><input type="text" id="gm" value="' + esc(s.model) + '"></div>' +
@@ -598,6 +418,7 @@
       '<div class="row"><button id="gsave">설정 저장</button><button id="gexp">백업 내려받기</button><button id="gimp">백업 불러오기</button><input type="file" id="gfile" accept="application/json" hidden></div></details>';
 
     document.getElementById('gt').value = genState.type;
+    document.getElementById('rateSel').addEventListener('change', function (e) { setSpeechRate(parseFloat(e.target.value)); toast('음성 속도를 ' + e.target.value + '배속으로 저장했습니다.'); });
     var st = document.getElementById('gst');
     function setStatus(msg, err) { st.className = 'status' + (err ? ' err' : ''); st.innerHTML = msg; }
     document.getElementById('gt').addEventListener('change', function (e) { genState.type = e.target.value; });
@@ -668,15 +489,43 @@
 
   /* ───────── 퀴즈 / 오답노트 ───────── */
   var quizUI = {
-    quiz: { type: 'written', subj: '', rand: false, pool: null, i: 0, tried: 0, correct: 0 },
+    quiz: { type: 'written', levelByType: { written: 1, practical: 1 }, pool: null, i: 0, tried: 0, correct: 0 },
     note: { type: 'written', subj: '', rand: false, pool: null, i: 0, tried: 0, correct: 0 }
   };
   function norm(s) { return String(s).toLowerCase().replace(/[\s·・,.\-()\[\]「」'"“”‘’~∙:;]/g, ''); }
 
+  /* 퀴즈 레벨 : 기본 100문항을 원래 순서대로 20개씩 5레벨로 나눈다 */
+  var LEVEL_SIZE = 20, LEVEL_COUNT = 5;
+  function baseLevels(type) {
+    var base = QDATA[type], out = [];
+    for (var i = 0; i < LEVEL_COUNT; i++) {
+      out.push(base.slice(i * LEVEL_SIZE, (i + 1) * LEVEL_SIZE).map(function (q) { return q.id; }));
+    }
+    return out;
+  }
+  function levelIds(type, lv) { return lv === 'bonus' ? store.added[type].filter(hasBlanks).map(function (q) { return q.id; }) : (baseLevels(type)[lv - 1] || []); }
+  function levelSolvedCount(type, lv) {
+    var ids = levelIds(type, lv);
+    return ids.filter(function (id) { return !!store.solved[id]; }).length;
+  }
+  function levelComplete(type, lv) {
+    var ids = levelIds(type, lv);
+    return ids.length > 0 && ids.every(function (id) { return !!store.solved[id]; });
+  }
+  function levelUnlocked(type, lv) {
+    if (lv === 'bonus' || lv <= 1) return true;
+    return levelComplete(type, lv - 1);
+  }
+
   function buildPool(mode) {
     var ui = quizUI[mode];
+    if (mode === 'quiz') {
+      ui.pool = shuffle(levelIds(ui.type, ui.levelByType[ui.type]));
+      ui.i = 0;
+      return;
+    }
     var ids = getList(ui.type).filter(function (q) {
-      return hasBlanks(q) && subjOk(q, ui.subj) && (mode === 'quiz' || store.wrong[q.id]);
+      return hasBlanks(q) && subjOk(q, ui.subj) && store.wrong[q.id];
     }).map(function (q) { return q.id; });
     ui.pool = ui.rand ? shuffle(ids) : ids;
     ui.i = 0;
@@ -694,9 +543,14 @@
         var inp = document.createElement('input');
         inp.type = 'text'; inp.className = 'blank'; inp.autocomplete = 'off'; inp.spellcheck = false;
         var w = Math.max.apply(null, accepts.map(function (s) { return s.length; }));
-        inp.style.width = Math.min(Math.max(w * 1.9 + 3, 6), 40) + 'ch';
+        inp.style.width = Math.min(Math.max(w * 1.9 + 3, 6), 34) + 'ch';
+        inp.style.maxWidth = '68vw';
         var b = { inp: inp, accepts: accepts, corr: null };
-        blanks.push(b); d.appendChild(inp); last = m.index + m[0].length;
+        blanks.push(b);
+        d.appendChild(document.createTextNode('('));
+        d.appendChild(inp);
+        d.appendChild(document.createTextNode(')'));
+        last = m.index + m[0].length;
       }
       d.appendChild(document.createTextNode(line.slice(last)));
       box.appendChild(d);
@@ -726,6 +580,19 @@
     return ok;
   }
 
+  function levelBtnsHTML(type, curLv) {
+    var html = '';
+    for (var n = 1; n <= LEVEL_COUNT; n++) {
+      var unlocked = levelUnlocked(type, n), complete = levelComplete(type, n);
+      var cls = (n === curLv ? 'on' : '') + (unlocked ? '' : ' locked') + (complete ? ' done' : '');
+      html += '<button data-lv="' + n + '" class="' + cls + '"' + (unlocked ? '' : ' aria-disabled="true"') + '>' +
+        (unlocked ? (complete ? '✓ ' : '') : '🔒 ') + n + '레벨<small>' + levelSolvedCount(type, n) + '/' + (levelIds(type, n).length || LEVEL_SIZE) + '</small></button>';
+    }
+    if (store.added[type].filter(hasBlanks).length) {
+      html += '<button data-lv="bonus" class="' + (curLv === 'bonus' ? 'on' : '') + '">사용자추가<small>' + levelIds(type, 'bonus').length + '</small></button>';
+    }
+    return html;
+  }
   function viewQuiz(mode) {
     var ui = quizUI[mode];
     var isNote = mode === 'note';
@@ -741,37 +608,55 @@
       var other = ui.type === 'written' ? 'practical' : 'written';
       if (!ui.pool.length && !ui.subj && qcount(other) > 0) { ui.type = other; buildPool(mode); }
     } else {
-      var fresh = getList(ui.type).filter(function (q) { return hasBlanks(q) && subjOk(q, ui.subj); }).length;
-      if (!ui.pool || ui.pool.length !== fresh) buildPool(mode);
+      /* 퀴즈는 이 메뉴에 들어올 때마다(레벨·유형 전환 포함) 새로 섞는다 */
+      buildPool(mode);
     }
     var subs = subjects(ui.type);
+    var curLv = isNote ? null : ui.levelByType[ui.type];
     root.innerHTML =
       head(TYPES[ui.type] + (isNote ? ' 오답노트' : ' 퀴즈'),
         isNote ? TYPES[ui.type] + ' 퀴즈에서 틀린 문제만 모아 다시 풉니다. 이해했다면 “오답 해제”로 목록에서 뺄 수 있습니다.'
-          : (ui.type === 'written' ? '필답형 예상문제(기본 100문항 + 사용자추가)의 정답 핵심어를 빈칸에 채워 넣으며 복습합니다.' : '작업형 예상문제(기본 100문항 + 사용자추가)의 위험요인·안전조치 핵심어를 빈칸에 채워 넣으며 복습합니다.') + ' 시험처럼 풀어 보려면 “모의고사” 메뉴를 이용하세요.',
+          : (ui.type === 'written' ? '필답형 예상문제를 레벨별로 20문항씩 풉니다. 메뉴를 열 때마다 순서를 섞고, 한 레벨을 모두 맞혀야 다음 레벨이 열립니다.' : '작업형 예상문제를 레벨별로 20문항씩 풉니다. 메뉴를 열 때마다 순서를 섞고, 한 레벨을 모두 맞혀야 다음 레벨이 열립니다.'),
         '<span class="tag" id="qtag"></span>') +
       '<div class="qwrap"><div class="seg seg-type" id="qtseg">' +
       ['written', 'practical'].map(function (t) {
         return '<button data-t="' + t + '" class="' + (t === ui.type ? 'on' : '') + '">' + TYPES[t] + (isNote ? ' 오답노트' : ' 퀴즈') + '<small style="margin-left:8px">' + qcount(t) + '</small></button>';
-      }).join('') + '</div><div class="bar">' +
-      '<select id="qs"><option value="">전체 과목</option>' + opts(subs, ui.subj) + '</select>' +
-      '<select id="qo"><option value="seq">순서대로</option><option value="rand"' + (ui.rand ? ' selected' : '') + '>무작위</option></select>' +
-      (isNote ? '<button class="danger sm" id="qclear">전체 해제</button>' : '') +
+      }).join('') + '</div>' +
+      (isNote ? '' : '<div class="seg seg-level" id="qlv">' + levelBtnsHTML(ui.type, curLv) + '</div>') +
+      '<div class="bar">' +
+      (isNote ? '<select id="qs"><option value="">전체 과목</option>' + opts(subs, ui.subj) + '</select>' +
+        '<select id="qo"><option value="seq">순서대로</option><option value="rand"' + (ui.rand ? ' selected' : '') + '>무작위</option></select>' +
+        '<button class="danger sm" id="qclear">전체 해제</button>' : '') +
       '<div class="stat" id="qstat"></div></div>' +
       '<div class="prog"><i id="qbar"></i></div><div id="qbody"></div></div>';
 
-    document.getElementById('qs').addEventListener('change', function (e) { ui.subj = e.target.value; buildPool(mode); viewQuiz(mode); });
-    document.getElementById('qo').addEventListener('change', function (e) { ui.rand = e.target.value === 'rand'; buildPool(mode); viewQuiz(mode); });
-    if (isNote) document.getElementById('qclear').addEventListener('click', function () {
-      if (!Object.keys(store.wrong).length) return;
-      if (!confirm('오답노트를 모두 비울까요?')) return;
-      store.wrong = {}; save(); drawNav('note'); buildPool(mode); viewQuiz(mode);
-    });
+    if (isNote) {
+      document.getElementById('qs').addEventListener('change', function (e) { ui.subj = e.target.value; buildPool(mode); viewQuiz(mode); });
+      document.getElementById('qo').addEventListener('change', function (e) { ui.rand = e.target.value === 'rand'; buildPool(mode); viewQuiz(mode); });
+      document.getElementById('qclear').addEventListener('click', function () {
+        if (!Object.keys(store.wrong).length) return;
+        if (!confirm('오답노트를 모두 비울까요?')) return;
+        store.wrong = {}; save(); drawNav('note'); buildPool(mode); viewQuiz(mode);
+      });
+    } else {
+      document.getElementById('qlv').addEventListener('click', function (e) {
+        var b = e.target.closest('button[data-lv]'); if (!b) return;
+        var lv = b.getAttribute('data-lv'); lv = lv === 'bonus' ? 'bonus' : parseInt(lv, 10);
+        if (lv !== 'bonus' && !levelUnlocked(ui.type, lv)) { toast((lv - 1) + '레벨을 모두 맞혀야 열립니다.'); return; }
+        ui.levelByType[ui.type] = lv; ui.tried = 0; ui.correct = 0;
+        viewQuiz(mode);
+      });
+    }
     document.getElementById('qtseg').addEventListener('click', function (e) {
       var b = e.target.closest('button[data-t]'); if (!b) return;
       ui.type = b.getAttribute('data-t'); ui.subj = ''; ui.tried = 0; ui.correct = 0;
-      buildPool(mode); viewQuiz(mode);
+      viewQuiz(mode);
     });
+    function drawLevels() {
+      if (isNote) return;
+      var el = document.getElementById('qlv'); if (!el) return;
+      el.innerHTML = levelBtnsHTML(ui.type, ui.levelByType[ui.type]);
+    }
     drawQ();
 
     function drawStat() {
@@ -795,10 +680,12 @@
       var ab = buildAnswer(q);
       var card = document.createElement('div'); card.className = 'qcard';
       card.innerHTML =
-        '<div class="qh"><span><span class="no">' + (q.user ? qNo(q) : 'No.' + qNo(q)) + '</span> · ' + esc(q.subject) + (q.mock ? ' · 모의고사 ' + q.mock + '회' : '') + '</span><span id="wf"></span></div>' +
+        '<div class="qh"><span>' + iconFor(q.subject) + '<span class="no">' + (q.user ? qNo(q) : 'No.' + qNo(q)) + '</span> · ' + esc(q.subject) + (q.mock ? ' · 모의고사 ' + q.mock + '회' : '') + '</span><span id="wf"></span></div>' +
         '<div class="qb"><p class="qtext">' + esc(q.q) + '</p><div id="abox"></div>' +
         '<div class="banner" id="bn"></div><div id="rv"></div>' +
-        '<div class="qact"><button class="pri" id="bg">채점</button><button id="bs">정답 보기</button><button id="br">다시 풀기</button><button id="bw"></button></div></div>' +
+        '<div class="qact"><button class="pri" id="bg">채점</button><button id="bs">정답 보기</button><button id="br">다시 풀기</button>' +
+        '<button class="spk" data-spk="' + q.id + ':q" title="문제 듣기">🔊문제</button><button class="spk" data-spk="' + q.id + ':a" title="정답 듣기">🔊정답</button>' +
+        '<button id="bbm"></button><button id="bw"></button></div></div>' +
         '<div class="qnav"><button id="bp">◀ 이전</button><div class="jump"><input type="number" id="bj" min="1" max="' + ui.pool.length + '" placeholder="번호"><button id="bjg" class="sm">이동</button></div><button id="bn2" class="dark">다음 ▶</button></div>';
       body.innerHTML = ''; body.appendChild(card);
       card.querySelector('#abox').appendChild(ab.box);
@@ -810,7 +697,12 @@
         card.querySelector('#bw').textContent = w ? '오답 해제' : '오답노트에 담기';
         drawNav(mode);
       }
-      flag();
+      function flagBM() {
+        var b = card.querySelector('#bbm'), on = isBM(q.id);
+        b.textContent = (on ? '★' : '☆') + ' 책갈피'; b.classList.toggle('bmbtn', true); b.classList.toggle('on', on);
+      }
+      flag(); flagBM();
+      card.querySelector('#bbm').addEventListener('click', function () { toggleBM(q.id); flagBM(); drawNav(mode); });
 
       function reveal() {
         card.querySelector('#rv').innerHTML = '<div class="reveal"><b>정답</b>' + ansHTML(q.a) + '</div>';
@@ -830,7 +722,19 @@
         reveal();
         if (!counted) { ui.tried++; if (all) ui.correct++; counted = true; }
         if (!all && !store.wrong[q.id]) { store.wrong[q.id] = Date.now(); save(); flag(); }
-        if (all && isNote) toast('정답입니다. 이해했다면 “오답 해제”를 눌러 목록에서 뺄 수 있습니다.');
+        if (all) {
+          var wasSolved = !!store.solved[q.id];
+          if (!wasSolved) { store.solved[q.id] = Date.now(); save(); }
+          if (isNote) {
+            toast('정답입니다. 이해했다면 “오답 해제”를 눌러 목록에서 뺄 수 있습니다.');
+          } else {
+            var lvNow = ui.levelByType[ui.type];
+            if (lvNow !== 'bonus' && !wasSolved && levelComplete(ui.type, lvNow)) {
+              toast(lvNow < LEVEL_COUNT ? (lvNow + '레벨을 모두 맞혔습니다! ' + (lvNow + 1) + '레벨이 열렸습니다.') : '모든 레벨을 완료했습니다!');
+            }
+            drawLevels();
+          }
+        }
         drawStat(); graded = true;
       });
       card.querySelector('#bs').addEventListener('click', reveal);
@@ -863,6 +767,303 @@
     }
   }
 
+
+  /* ───────── 북마크 ───────── */
+  var bmUI = { type: '', q: '' };
+  function viewBookmarks() {
+    var ui = bmUI;
+    var ids = Object.keys(store.bookmarks).sort(function (a, b) { return store.bookmarks[b] - store.bookmarks[a]; });
+    var items = ids.map(findQ).filter(Boolean);
+    if (items.length !== ids.length) {
+      /* 원본 문제가 삭제된 책갈피는 조용히 정리한다 */
+      var validIds = items.map(function (q) { return q.id; });
+      ids.forEach(function (id) { if (validIds.indexOf(id) < 0) delete store.bookmarks[id]; });
+      save();
+    }
+    root.innerHTML =
+      head('북마크', '표시해 둔 문제를 모아봅니다. “고정 보기”를 누르면 화면 위에 작은 창으로 띄워, 다른 문제를 풀거나 스크롤하면서도 함께 볼 수 있습니다.',
+        '<span class="tag">' + items.length + '개</span>') +
+      '<div class="bar">' +
+      '<input type="search" id="bq" class="grow" placeholder="문제·정답 검색" value="' + esc(ui.q) + '">' +
+      '<select id="bt"><option value="">전체 유형</option>' +
+      '<option value="written"' + (ui.type === 'written' ? ' selected' : '') + '>필답형</option>' +
+      '<option value="practical"' + (ui.type === 'practical' ? ' selected' : '') + '>작업형</option>' +
+      '<option value="mock"' + (ui.type === 'mock' ? ' selected' : '') + '>모의고사</option></select>' +
+      '<button class="sm" id="bmPlayAll" title="지금 표시된 북마크를 문제→정답 순서로 이어 듣습니다">▶ 전체 듣기</button>' +
+      '<span class="meta" id="bc"></span></div>' +
+      '<div class="wrap"><table class="tbl list" id="tb"><thead><tr><th>No</th><th>유형</th><th>문제</th><th>정답 · 관리</th></tr></thead><tbody id="tbody"></tbody></table></div>';
+
+    function kindOf(q) { return q.mock ? 'mock' : q.type; }
+    function kindLabel(q) { return q.mock ? (TYPES[q.type] + ' 모의 ' + q.mock + '회') : TYPES[q.type]; }
+    function row(q) {
+      return '<tr data-id="' + q.id + '"><td class="no">' + qNo(q) + '</td>' +
+        '<td class="sj">' + iconFor(q.subject) + '<span class="subj-chip">' + esc(kindLabel(q)) + '</span><br><span class="meta" style="font-size:12px">' + esc(q.subject) + '</span></td>' +
+        '<td class="q">' + esc(q.q) + '</td><td class="a"><div class="ans">' + ansHTML(q.a) + '</div>' +
+        '<div class="rowbtns"><button class="sm" data-float="' + q.id + '">📌 고정 보기</button>' + spkBtnsHTML(q.id) + '<button class="sm danger" data-bm="' + q.id + '">해제</button></div></td></tr>';
+    }
+    var visibleIds = [];
+    function draw() {
+      var kw = ui.q.trim().toLowerCase();
+      var list = items.filter(function (q) {
+        return (!ui.type || kindOf(q) === ui.type) && (!kw || (q.q + ' ' + q.a).toLowerCase().indexOf(kw) >= 0);
+      });
+      visibleIds = list.map(function (q) { return q.id; });
+      document.getElementById('tbody').innerHTML = list.length ? list.map(row).join('')
+        : '<tr><td colspan="4" class="empty">북마크한 문제가 없습니다.<br>필답형·작업형·모의고사·퀴즈 화면의 ☆ 책갈피 버튼을 눌러 보세요.</td></tr>';
+      document.getElementById('bc').textContent = list.length + '개 표시';
+    }
+    draw();
+    document.getElementById('bq').addEventListener('input', function (e) { ui.q = e.target.value; draw(); });
+    document.getElementById('bt').addEventListener('change', function (e) { ui.type = e.target.value; draw(); });
+    document.getElementById('bmPlayAll').addEventListener('click', function () {
+      if (!visibleIds.length) { toast('들을 북마크가 없습니다.'); return; }
+      openFloat(visibleIds, visibleIds[0], true);
+    });
+    document.getElementById('tbody').addEventListener('click', function (e) {
+      var f = e.target.closest('[data-float]');
+      if (f) { openFloat(visibleIds, f.getAttribute('data-float')); return; }
+      var d = e.target.closest('[data-bm]');
+      if (d) {
+        var id = d.getAttribute('data-bm');
+        toggleBM(id);
+        items = items.filter(function (q) { return q.id !== id; });
+        draw(); drawNav('bookmarks');
+        return;
+      }
+    });
+  }
+
+  /* ───────── 플로팅 뷰(화면 위 고정 창) ─────────
+     휴대폰 브라우저는 앱 전환 후에도 유지되는 유튜브식 PiP를 일반 웹페이지에
+     지원하지 않으므로, 이 앱 화면 안에서 끌어서 옮기고 크기를 조절할 수 있는
+     작은 창으로 구현한다. 다른 화면(퀴즈·목록 등)을 오가거나 스크롤해도 유지된다. */
+  var floatPanel = null;
+  var floatState = { ids: [], i: 0, auto: false };
+  function ensureFloat() {
+    if (floatPanel) return floatPanel;
+    var p = document.createElement('div');
+    p.id = 'floatPanel'; p.className = 'float-panel'; p.hidden = true;
+    p.innerHTML =
+      '<div class="fp-head" id="fpHead"><span class="fp-drag">⠿⠿</span><span class="fp-title" id="fpTitle"></span>' +
+      '<div class="fp-btns"><button id="fpBM" aria-label="책갈피" title="책갈피">☆</button>' +
+      '<button id="fpAuto" aria-label="전체 듣기" title="전체 듣기(문제→정답 이어 듣기)">▶</button>' +
+      '<button id="fpSpk" aria-label="한 문제만 듣기" title="한 문제만 듣기">🔊</button>' +
+      '<button id="fpRate" aria-label="속도" title="읽는 속도(누르면 바뀝니다)">1x</button>' +
+      '<button id="fpPrev" aria-label="이전" title="이전 문제">⏮</button><button id="fpNext" aria-label="다음" title="다음 문제">⏭</button>' +
+      '<button id="fpClose" aria-label="닫기" title="닫기">✕</button></div></div>' +
+      '<div class="fp-body" id="fpBody"></div><div class="fp-resize" id="fpResize" aria-hidden="true"></div>';
+    document.body.appendChild(p);
+    floatPanel = p;
+
+    var head = p.querySelector('#fpHead'), drag = null;
+    head.addEventListener('pointerdown', function (e) {
+      if (e.target.closest('button')) return;
+      drag = { sx: e.clientX, sy: e.clientY, ox: p.offsetLeft, oy: p.offsetTop };
+      head.setPointerCapture(e.pointerId);
+    });
+    head.addEventListener('pointermove', function (e) {
+      if (!drag) return;
+      var nx = drag.ox + (e.clientX - drag.sx), ny = drag.oy + (e.clientY - drag.sy);
+      nx = Math.max(4, Math.min(window.innerWidth - p.offsetWidth - 4, nx));
+      ny = Math.max(4, Math.min(window.innerHeight - p.offsetHeight - 4, ny));
+      p.style.left = nx + 'px'; p.style.top = ny + 'px'; p.style.right = 'auto'; p.style.bottom = 'auto';
+    });
+    ['pointerup', 'pointercancel'].forEach(function (ev) { head.addEventListener(ev, function () { drag = null; }); });
+
+    var rs = p.querySelector('#fpResize'), resize = null;
+    rs.addEventListener('pointerdown', function (e) {
+      resize = { sx: e.clientX, sy: e.clientY, w: p.offsetWidth, h: p.offsetHeight };
+      rs.setPointerCapture(e.pointerId); e.stopPropagation();
+    });
+    rs.addEventListener('pointermove', function (e) {
+      if (!resize) return;
+      var nw = Math.max(240, Math.min(window.innerWidth - 16, resize.w + (e.clientX - resize.sx)));
+      var nh = Math.max(160, Math.min(window.innerHeight - 16, resize.h + (e.clientY - resize.sy)));
+      p.style.width = nw + 'px'; p.style.height = nh + 'px';
+    });
+    ['pointerup', 'pointercancel'].forEach(function (ev) { rs.addEventListener(ev, function () { resize = null; }); });
+
+    p.querySelector('#fpClose').addEventListener('click', closeFloat);
+    p.querySelector('#fpPrev').addEventListener('click', function () { floatStep(-1); });
+    p.querySelector('#fpNext').addEventListener('click', function () { floatStep(1); });
+    p.querySelector('#fpSpk').addEventListener('click', function () {
+      var q = findQ(floatState.ids[floatState.i]);
+      if (q) speakSeq([q.q, q.a]);
+    });
+    p.querySelector('#fpBM').addEventListener('click', function () {
+      toggleBM(floatState.ids[floatState.i]); updateFpBM();
+    });
+    p.querySelector('#fpAuto').addEventListener('click', floatAutoToggle);
+    p.querySelector('#fpRate').addEventListener('click', cycleRate);
+    p.querySelector('#fpRate').textContent = speechRate() + 'x';
+    return p;
+  }
+  function floatRender() {
+    var id = floatState.ids[floatState.i], q = findQ(id);
+    if (!floatPanel) return;
+    if (!q) { floatPanel.querySelector('#fpBody').innerHTML = '<div class="empty">문제를 찾을 수 없습니다.</div>'; return; }
+    floatPanel.querySelector('#fpTitle').textContent = (floatState.i + 1) + ' / ' + floatState.ids.length + ' · ' + q.subject;
+    floatPanel.querySelector('#fpBody').innerHTML = '<p class="fp-q">' + esc(q.q) + '</p><div class="fp-a">' + ansHTML(q.a) + '</div>';
+    updateFpBM();
+  }
+  function updateFpBM() {
+    if (!floatPanel) return;
+    var on = isBM(floatState.ids[floatState.i]);
+    var b = floatPanel.querySelector('#fpBM');
+    b.textContent = on ? '★' : '☆'; b.classList.toggle('on', on); b.title = on ? '책갈피 해제' : '책갈피 추가';
+  }
+  function updateFpAuto() {
+    if (!floatPanel) return;
+    var b = floatPanel.querySelector('#fpAuto');
+    b.textContent = floatState.auto ? '⏸' : '▶'; b.classList.toggle('on', floatState.auto);
+    b.title = floatState.auto ? '전체 듣기 정지' : '전체 듣기(문제→정답 이어 듣기)';
+  }
+  function floatPlayCurrent() {
+    var q = findQ(floatState.ids[floatState.i]);
+    if (!q) { floatState.auto = false; updateFpAuto(); return; }
+    speakSeq([q.q, q.a], function () {
+      if (!floatState.auto) return;
+      if (floatState.i < floatState.ids.length - 1) {
+        floatState.i++; floatRender(); floatPlayCurrent();
+      } else {
+        floatState.auto = false; updateFpAuto(); toast('전체 듣기를 마쳤습니다.');
+      }
+    });
+  }
+  function floatAutoToggle() {
+    floatState.auto = !floatState.auto;
+    updateFpAuto();
+    if (floatState.auto) floatPlayCurrent(); else stopSpeak();
+  }
+  function floatStep(d) {
+    if (!floatState.ids.length) return;
+    floatState.i = (floatState.i + d + floatState.ids.length) % floatState.ids.length;
+    floatRender();
+    if (floatState.auto) floatPlayCurrent();
+  }
+  function openFloat(ids, startId, autoStart) {
+    if (!ids || !ids.length) { toast('들을 문제가 없습니다.'); return; }
+    ensureFloat();
+    floatState.ids = ids.slice();
+    var idx = floatState.ids.indexOf(startId);
+    floatState.i = idx >= 0 ? idx : 0;
+    if (!floatPanel.style.left && !floatPanel.style.right) {
+      floatPanel.style.right = '14px'; floatPanel.style.bottom = 'calc(88px + env(safe-area-inset-bottom))';
+    }
+    floatPanel.hidden = false;
+    floatRender(); updateFAB();
+    floatState.auto = !!autoStart; updateFpAuto();
+    if (floatState.auto) floatPlayCurrent();
+  }
+  function closeFloat() {
+    floatState.auto = false; stopSpeak();
+    if (floatPanel) floatPanel.hidden = true;
+    updateFAB();
+  }
+
+  var bmFab = document.createElement('button');
+  bmFab.id = 'bmFab'; bmFab.className = 'bm-fab'; bmFab.type = 'button'; bmFab.hidden = true;
+  document.body.appendChild(bmFab);
+  bmFab.addEventListener('click', function () {
+    if (floatPanel && !floatPanel.hidden) { closeFloat(); return; }
+    var ids = Object.keys(store.bookmarks).sort(function (a, b) { return store.bookmarks[b] - store.bookmarks[a]; });
+    openFloat(ids, ids[0]);
+  });
+  function updateFAB() {
+    var n = Object.keys(store.bookmarks).length;
+    var open = !!(floatPanel && !floatPanel.hidden);
+    bmFab.hidden = n === 0 && !open;
+    bmFab.textContent = open ? '✕' : '📌';
+    bmFab.title = open ? '고정 보기 닫기' : (n + '개 책갈피 보기');
+  }
+
+
+  /* ───────── 음성으로 듣기(TTS) ─────────
+     기기에 이미 설치된 음성 엔진을 쓰는 브라우저 내장 기능이라 별도 설치나
+     인터넷 연결 없이 오프라인에서도 동작한다(단말기에 한국어 음성이 없으면
+     다른 억양으로 읽힐 수 있다). */
+  var ttsOn = 'speechSynthesis' in window;
+  function cleanForSpeech(s) {
+    return String(s)
+      .replace(/\{\{([^}|]+)(\|[^}]*)?\}\}/g, '$1')
+      .replace(/[①②③④⑤⑥⑦⑧⑨⑩]/g, '. ')
+      .replace(/[▶►]/g, '')
+      .replace(/\n+/g, '. ')
+      .replace(/\s{2,}/g, ' ')
+      .trim();
+  }
+  var RATES = [0.75, 1, 1.25, 1.5, 1.75, 2];
+  function speechRate() { return store.settings.rate || 1; }
+  function setSpeechRate(r) {
+    store.settings.rate = r; save();
+    var b = floatPanel && floatPanel.querySelector('#fpRate');
+    if (b) b.textContent = r + 'x';
+    var sel = document.getElementById('rateSel');
+    if (sel) sel.value = String(r);
+  }
+  function cycleRate() {
+    var i = RATES.indexOf(speechRate());
+    setSpeechRate(RATES[(i + 1) % RATES.length]);
+  }
+  function speak(text) {
+    if (!ttsOn) { toast('이 브라우저는 음성 읽기를 지원하지 않습니다.'); return; }
+    window.speechSynthesis.cancel();
+    var u = new SpeechSynthesisUtterance(cleanForSpeech(text));
+    u.lang = 'ko-KR'; u.rate = speechRate();
+    window.speechSynthesis.speak(u);
+  }
+  function speakSeq(list, onDone) {
+    if (!ttsOn) { toast('이 브라우저는 음성 읽기를 지원하지 않습니다.'); if (onDone) onDone(); return; }
+    window.speechSynthesis.cancel();
+    var i = 0;
+    function next() {
+      if (i >= list.length) { if (onDone) onDone(); return; }
+      var u = new SpeechSynthesisUtterance(cleanForSpeech(list[i]));
+      u.lang = 'ko-KR'; u.rate = speechRate();
+      i++;
+      u.onend = next;
+      window.speechSynthesis.speak(u);
+    }
+    next();
+  }
+  function stopSpeak() { if (ttsOn) window.speechSynthesis.cancel(); }
+  document.addEventListener('click', function (e) {
+    var sp = e.target.closest('[data-spk]');
+    if (!sp) return;
+    var parts = sp.getAttribute('data-spk').split(':'), id = parts[0], which = parts[1];
+    var q = findQ(id);
+    if (!q) return;
+    if (which === 'q') speak(q.q);
+    else if (which === 'a') speak(q.a);
+    else speakSeq([q.q, q.a]);
+  });
+
+  /* ───────── 과목·분야 참고 아이콘 ─────────
+     실제 시험의 사진·영상 자료는 저작권이 있어 그대로 옮길 수 없으므로,
+     과목/분야를 한눈에 알아볼 수 있도록 직접 그린 단순 선 아이콘을 붙인다. */
+  var ICONS = {
+    '산업안전관리론': '<path d="M12 3l8 4v5c0 5-3.5 8-8 9-4.5-1-8-4-8-9V7z"/><path d="M9 12l2 2 4-4"/>',
+    '안전보건교육': '<path d="M3 8l9-4 9 4-9 4-9-4z"/><path d="M7 10v5c0 1.5 2.5 3 5 3s5-1.5 5-3v-5"/>',
+    '인간공학·시스템안전': '<circle cx="12" cy="8" r="3"/><path d="M5 21c0-4 3-6 7-6s7 2 7 6"/><path d="M2 12h3M19 12h3"/>',
+    '기계위험방지기술': '<circle cx="12" cy="12" r="3"/><path d="M12 2v3M12 19v3M4.2 4.2l2.1 2.1M17.7 17.7l2.1 2.1M2 12h3M19 12h3M4.2 19.8l2.1-2.1M17.7 6.3l2.1-2.1"/>',
+    '전기위험방지기술': '<path d="M13 2L4 14h7l-1 8 9-12h-7z"/>',
+    '화학설비위험방지기술': '<path d="M9 2h6M10 2v6l-5 9a2 2 0 0 0 2 3h10a2 2 0 0 0 2-3l-5-9V2"/>',
+    '건설안전기술': '<path d="M3 21h18M5 21V9l7-5 7 5v12M9 21v-6h6v6"/>',
+    '건설안전': '<path d="M3 21h18M5 21V9l7-5 7 5v12M9 21v-6h6v6"/>',
+    '기계안전': '<circle cx="12" cy="12" r="3"/><path d="M12 2v3M12 19v3M4.2 4.2l2.1 2.1M17.7 17.7l2.1 2.1M2 12h3M19 12h3M4.2 19.8l2.1-2.1M17.7 6.3l2.1-2.1"/>',
+    '전기안전': '<path d="M13 2L4 14h7l-1 8 9-12h-7z"/>',
+    '화학안전': '<path d="M9 2h6M10 2v6l-5 9a2 2 0 0 0 2 3h10a2 2 0 0 0 2-3l-5-9V2"/>',
+    '보호구·표지': '<path d="M12 3l8 4v5c0 5-3.5 8-8 9-4.5-1-8-4-8-9V7z"/><path d="M9 12l2 2 4-4"/>',
+    '기타': '<circle cx="12" cy="12" r="9"/><path d="M9.5 9a2.5 2.5 0 1 1 3.5 2.3c-.9.4-1.5 1-1.5 2.2M12 17h.01"/>',
+    '사용자추가': '<circle cx="12" cy="12" r="9"/><path d="M12 8v8M8 12h8"/>'
+  };
+  function iconFor(subject) {
+    var p = ICONS[subject];
+    if (!p) return '';
+    return '<svg class="subj-ico" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" ' +
+      'stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">' + p + '</svg>';
+  }
+
   /* ───────── 앱(PWA) 설치 · 오프라인 ───────── */
   var deferredPrompt = null;
   var installBtn = document.getElementById('install');
@@ -893,5 +1094,6 @@
     window.addEventListener('load', function () { navigator.serviceWorker.register('sw.js').catch(function () {}); });
   }
 
+  updateFAB();
   route();
 })();
